@@ -36,6 +36,7 @@ struct droptarget {
     atomic_int ref_cnt;
     struct mp_log *log;
     struct input_ctx *input_ctx;
+    HWND window;
     struct mp_vo_opts *opts;
     DWORD last_effect;
     IDataObject *data_obj;
@@ -165,7 +166,10 @@ static STDMETHODIMP DropTarget_Drop(IDropTarget *self, IDataObject *pDataObj,
             }
 
             GlobalUnlock(medium.hGlobal);
-            mp_input_drop_files(t->input_ctx, recvd_files, files, action);
+            POINT client = {.x = pt.x, .y = pt.y};
+            ScreenToClient(t->window, &client);
+            mp_event_drop_files_at(t->input_ctx, recvd_files, files, action,
+                                   client.x, client.y);
             talloc_free(files);
         }
 
@@ -207,7 +211,7 @@ static IDropTargetVtbl idroptarget_vtbl = {
 
 IDropTarget *mp_w32_droptarget_create(struct mp_log *log,
                                       struct mp_vo_opts *opts,
-                                      struct input_ctx *input_ctx)
+                                      struct input_ctx *input_ctx, HWND window)
 {
     fmtetc_url.cfFormat = RegisterClipboardFormatW(L"UniformResourceLocatorW");
 
@@ -219,6 +223,7 @@ IDropTarget *mp_w32_droptarget_create(struct mp_log *log,
     dt->log = mp_log_new(dt, log, "droptarget");
     dt->opts = opts;
     dt->input_ctx = input_ctx;
+    dt->window = window;
 
     return &dt->iface;
 }

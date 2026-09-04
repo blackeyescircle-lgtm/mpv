@@ -50,4 +50,15 @@ bool mp_w32_create_anon_pipe(HANDLE *server, HANDLE *client,
 // resolvable shell link, otherwise returns NULL.
 wchar_t *mp_w32_get_shell_link_target(wchar_t *path);
 
+// Return the current executable path in UTF-8 talloc memory.
+char *mp_w32_get_module_path(void *talloc_ctx);
+char *mp_w32_get_desktop_path(void *talloc_ctx);
+
+// Create or replace a Windows Shell shortcut. All strings are UTF-8; optional
+// values can be NULL. The icon path may point at a generated .ico file.
+bool mp_w32_create_shell_link(const char *shortcut, const char *target,
+                              const char *arguments,
+                              const char *working_directory,
+                              const char *icon, const char *description);
+
 #endif

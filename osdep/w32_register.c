@@ -43,6 +43,10 @@
 #define KEY_MPV_CAPABILITIES KEY_MPV_CAPABILITIES_APP L"\\Capabilities"
 #define KEY_MPV_UNINSTALL L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\" MPV_NAME
 
+#define GRID_PROG_ID L"io.mpv.grid-project"
+#define KEY_GRID_EXTENSION L"Software\\Classes\\.grd"
+#define KEY_GRID_PROG_ID L"Software\\Classes\\" GRID_PROG_ID
+
 #define MPV_PROG_ID_PREFIX L"io.mpv."
 #define MPV_PROG_ID(h) MPV_PROG_ID_PREFIX h
 #define KEY_MPV_PROG_ID(h) L"Software\\Classes\\" MPV_PROG_ID(h)
@@ -159,6 +163,47 @@ static void reg_add_str(struct mp_log *log, HKEY key, LPCWSTR sub_key,
            sub_key, name ? name : L"(Default)", value);
     reg_add(log, key, sub_key, name, REG_SZ, (const BYTE *)value,
             (wcslen(value) + 1) * sizeof(WCHAR));
+}
+
+bool mp_w32_register_grid_project(struct MPContext *mpctx)
+{
+    void *tmp = talloc_new(NULL);
+    struct mp_log *log = mp_log_new(tmp, mpctx->log, "grid-register");
+    wchar_t *exe = talloc_array(tmp, wchar_t, MP_PATH_MAX);
+    DWORD length = GetModuleFileNameW(NULL, exe, MP_PATH_MAX);
+    if (!length || length >= MP_PATH_MAX) {
+        mp_msg(log, MSGL_WARN, "Could not determine mpv-grid.exe path; "
+               ".grd association was not refreshed.\n");
+        talloc_free(tmp);
+        return false;
+    }
+
+    // The executable path exists only in the per-user association. A .grd
+    // document itself contains no launcher path, and launching an executable
+    // after moving it rewrites this command with the new absolute location.
+    size_t command_size = length + 80;
+    wchar_t *command = talloc_array(tmp, wchar_t, command_size);
+    swprintf(command, command_size,
+             L"\"%ls\" --grid-project=\"%%1\" --grid-open-mode=fixed", exe);
+    reg_add_str(log, HKEY_CURRENT_USER, KEY_GRID_EXTENSION, NULL, GRID_PROG_ID);
+    reg_add_str(log, HKEY_CURRENT_USER, KEY_GRID_EXTENSION, L"Content Type",
+                L"application/x-mpv-grid");
+    reg_add_str(log, HKEY_CURRENT_USER, KEY_GRID_PROG_ID, NULL,
+                L"mpv Grid 播放现场");
+    reg_add_str(log, HKEY_CURRENT_USER, KEY_GRID_PROG_ID, L"FriendlyTypeName",
+                L"mpv Grid 播放现场");
+    // Each .grd starts with a valid ICO image. Asking the shell to extract the
+    // icon from %1 gives every playback snapshot its own Grid thumbnail.
+    reg_add_str(log, HKEY_CURRENT_USER, KEY_GRID_PROG_ID L"\\DefaultIcon",
+                NULL, L"\"%1\",0");
+    reg_add_str(log, HKEY_CURRENT_USER, KEY_GRID_PROG_ID L"\\shell", NULL,
+                L"open");
+    reg_add_str(log, HKEY_CURRENT_USER,
+                KEY_GRID_PROG_ID L"\\shell\\open\\command", NULL, command);
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL);
+    mp_msg(log, MSGL_V, ".grd association refreshed for: %ls\n", exe);
+    talloc_free(tmp);
+    return true;
 }
 
 static void reg_add_dwr(struct mp_log *log, HKEY key, LPCWSTR sub_key,

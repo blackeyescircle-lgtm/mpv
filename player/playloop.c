@@ -24,6 +24,7 @@
 #include "client.h"
 #include "command.h"
 #include "core.h"
+#include "grid.h"
 #include "mpv_talloc.h"
 #include "screenshot.h"
 
@@ -1071,10 +1072,15 @@ int handle_force_window(struct MPContext *mpctx, bool force)
             .encode_lavc_ctx = mpctx->encode_lavc_ctx,
             .wakeup_cb = mp_wakeup_core_cb,
             .wakeup_ctx = mpctx,
+            .grid_ctx = mpctx->grid,
+            .grid_snapshot = mp_grid_vo_snapshot,
+            .grid_empty = mp_grid_vo_empty,
+            .grid_layout = mp_grid_vo_layout,
         };
         mpctx->video_out = init_best_video_out(mpctx->global, &ex);
         if (!mpctx->video_out)
             goto err;
+        mp_grid_set_vo(mpctx->grid, mpctx->video_out);
         mpctx->mouse_cursor_visible = true;
     }
 
@@ -1280,6 +1286,8 @@ static void handle_clipboard_updates(struct MPContext *mpctx)
 
 void run_playloop(struct MPContext *mpctx)
 {
+    mp_grid_tick(mpctx->grid);
+
     if (encode_lavc_didfail(mpctx->encode_lavc_ctx)) {
         mpctx->stop_play = PT_ERROR;
         return;

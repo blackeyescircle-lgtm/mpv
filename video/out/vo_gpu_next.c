@@ -49,6 +49,7 @@
 #include "gpu/video.h"
 #include "gpu/video_shaders.h"
 #include "sub/osd.h"
+#include "player/grid.h"
 #include "gpu_next/context.h"
 
 #if HAVE_GL && defined(PL_HAVE_OPENGL)
@@ -1338,12 +1339,186 @@ static void update_tm_viz(struct pl_color_map_params *params,
 static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
                                      const struct mp_image *mpi);
 
+static struct mp_rect grid_source_rect(struct mp_image *mpi, double zoom,
+                                       double center_x, double center_y)
+{
+    struct mp_rect src = {0, 0, mpi->params.w, mpi->params.h};
+    if (mp_image_crop_valid(&mpi->params))
+        src = mpi->params.crop;
+
+    zoom = MPCLAMP(zoom, 1.0, 8.0);
+    center_x = MPCLAMP(center_x, 0.0, 1.0);
+    center_y = MPCLAMP(center_y, 0.0, 1.0);
+    if (zoom <= 1.0)
+        return src;
+
+    int full_w = mp_rect_w(src);
+    int full_h = mp_rect_h(src);
+    int view_w = MPMAX(2, full_w / zoom);
+    int view_h = MPMAX(2, full_h / zoom);
+    int cx = src.x0 + center_x * full_w;
+    int cy = src.y0 + center_y * full_h;
+    int max_x = src.x1 - view_w;
+    int max_y = src.y1 - view_h;
+    src.x0 = MPCLAMP(cx - view_w / 2, src.x0, max_x);
+    src.y0 = MPCLAMP(cy - view_h / 2, src.y0, max_y);
+    src.x1 = src.x0 + view_w;
+    src.y1 = src.y0 + view_h;
+    return src;
+}
+
+static bool draw_grid_frame(struct vo *vo, struct vo_frame *frame,
+                            struct mp_grid_snapshot *grid)
+{
+    struct priv *p = vo->priv;
+    pl_gpu gpu = p->gpu;
+    struct ra_swapchain *sw = p->ra_ctx->swapchain;
+    struct pl_swapchain_frame swframe;
+    bool should_draw = sw->fns->start_frame(sw, NULL);
+
+    if (!should_draw || !pl_swapchain_start_frame(p->sw, &swframe))
+        return false;
+
+    pl_tex_clear(gpu, swframe.fbo, (float[4]){0.0, 0.0, 0.0, 1.0});
+
+    struct pl_frame base_target;
+    pl_frame_from_swapchain(&base_target, &swframe);
+    apply_target_options(p, &base_target, 0, false, 0, NULL);
+
+    struct pl_render_params params = p->pars->params;
+    params.info_callback = info_callback;
+    params.info_priv = vo;
+    params.frame_mixer = NULL;
+    params.preserve_mixing_cache = false;
+    params.skip_caching_single_frame = true;
+    // The swapchain is cleared once above. Each render call below targets one
+    // viewport, so it must preserve the pixels already produced for the other
+    // tiles. The defaults clear the target border/background on every call,
+    // which leaves only the last (bottom-right) tile visible.
+    params.border = PL_CLEAR_SKIP;
+    params.background = PL_CLEAR_SKIP;
+
+    int fbw = swframe.fbo->params.w;
+    int fbh = swframe.fbo->params.h;
+    // The regular rendering path attaches OSD overlays after preparing its
+    // target. Grid rendering returns early from draw_frame(), so it must do
+    // the same here. Use the complete framebuffer rather than the main
+    // video's letterboxed OSD rectangle: tile-local ASS positions are defined
+    // against the full Grid window. Copies of base_target are cropped per
+    // viewport below, which causes libplacebo to draw each overlay only in the
+    // tile intersecting its absolute destination coordinates.
+    struct mp_osd_res grid_osd = {
+        .w = fbw,
+        .h = fbh,
+        .display_par = 1.0,
+    };
+    update_overlays(vo, grid_osd, OSD_DRAW_OSD_ONLY,
+                    PL_OVERLAY_COORDS_DST_FRAME, &p->osd_state, &base_target,
+                    frame->current, 0, get_ref_luma(p));
+    bool valid = false;
+    int rendered = 0;
+    struct mp_rect grid_rect = mp_grid_calc_output_rect(
+        fbw, fbh, grid->rows, grid->columns, grid->aspect_w, grid->aspect_h);
+
+    for (int i = 0; i < grid->num_cells; i++) {
+        struct mp_grid_snapshot_cell *cell = &grid->cells[i];
+        struct mp_image *mpi = NULL;
+        if (i == 0 && frame->current) {
+            mpi = mp_image_new_ref(frame->current);
+        } else if (cell->image) {
+            mpi = cell->image;
+            cell->image = NULL;
+        }
+        if (!mpi)
+            continue;
+
+        struct frame_priv *fp = talloc_zero(mpi, struct frame_priv);
+        mpi->priv = fp;
+        fp->vo = vo;
+
+        struct pl_source_frame src_frame = {
+            .pts = mpi->pts,
+            .frame_data = mpi,
+            .map = map_frame,
+            .unmap = unmap_frame,
+            .discard = discard_frame,
+        };
+        pl_tex upload_tex[4] = {0};
+        struct pl_frame image;
+        if (!map_frame(gpu, upload_tex, &src_frame, &image))
+            continue;
+
+        int row = i / grid->columns;
+        int col = i % grid->columns;
+        struct mp_rect cell_rect = {
+            .x0 = grid_rect.x0 + mp_rect_w(grid_rect) * col / grid->columns,
+            .y0 = grid_rect.y0 + mp_rect_h(grid_rect) * row / grid->rows,
+            .x1 = grid_rect.x0 + mp_rect_w(grid_rect) * (col + 1) / grid->columns,
+            .y1 = grid_rect.y0 + mp_rect_h(grid_rect) * (row + 1) / grid->rows,
+        };
+
+        int dw = 0, dh = 0;
+        mp_image_params_get_dsize(&mpi->params, &dw, &dh);
+        int cw = mp_rect_w(cell_rect), ch = mp_rect_h(cell_rect);
+        double source_aspect = dh > 0 ? (double)dw / dh : 0;
+        double grid_aspect = grid->aspect_h > 0
+                                ? (double)grid->aspect_w / grid->aspect_h : 0;
+        // Equal-aspect sources fill their cells exactly, including across
+        // integer viewport boundaries. A genuinely different source is fit
+        // inside the existing cell: it keeps its aspect and touches either
+        // the horizontal or vertical edge pair without resizing the Grid.
+        bool different_aspect = source_aspect > 0 && grid_aspect > 0 &&
+            fabs(source_aspect - grid_aspect) > grid_aspect * 0.001;
+        if (different_aspect && cw > 0 && ch > 0) {
+            double scale = MPMIN((double)cw / dw, (double)ch / dh);
+            int rw = MPCLAMP(lrint(dw * scale), 1, cw);
+            int rh = MPCLAMP(lrint(dh * scale), 1, ch);
+            cell_rect.x0 += (cw - rw) / 2;
+            cell_rect.y0 += (ch - rh) / 2;
+            cell_rect.x1 = cell_rect.x0 + rw;
+            cell_rect.y1 = cell_rect.y0 + rh;
+        }
+
+        struct mp_rect src = grid_source_rect(mpi, cell->zoom,
+                                              cell->center_x, cell->center_y);
+        struct pl_frame target = base_target;
+        apply_crop(&image, src, mpi->params.w, mpi->params.h);
+        apply_crop(&target, cell_rect, fbw, fbh);
+        if (pl_render_image(p->rr, &image, &target, &params)) {
+            valid = true;
+            rendered++;
+        }
+
+        for (int n = 0; n < MP_ARRAY_SIZE(upload_tex); n++)
+            pl_tex_destroy(gpu, &upload_tex[n]);
+        unmap_frame(gpu, &image, &src_frame);
+    }
+
+    if (!valid)
+        pl_tex_clear(gpu, swframe.fbo, (float[4]){0.04, 0.04, 0.05, 1.0});
+
+    pl_gpu_flush(gpu);
+    MP_TRACE(vo, "Rendered grid frame: %d/%d tiles\n",
+             rendered, grid->num_cells);
+    p->frame_pending = true;
+    return true;
+}
+
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
+
+    struct mp_grid_snapshot grid = {0};
+    if (vo->extra.grid_snapshot &&
+        vo->extra.grid_snapshot(vo->extra.grid_ctx, &grid) && grid.enabled)
+    {
+        bool ok = draw_grid_frame(vo, frame, &grid);
+        mp_grid_snapshot_free(&grid);
+        return ok ? VO_TRUE : VO_FALSE;
+    }
 
     struct pl_render_params params = pars->params;
     const struct gl_video_opts *opts = p->opts_cache->opts;

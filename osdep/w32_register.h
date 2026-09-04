@@ -24,3 +24,8 @@ struct MPContext;
 // Handles the installation of mpv on Windows.
 // Return true if mpv should exit.
 bool mp_w32_handle_register(struct MPContext *mpctx);
+
+// Refresh the per-user .grd association so it always points at the currently
+// running mpv-grid.exe. This is intentionally separate from mpv's optional
+// system-wide registration flow and never requires administrator privileges.
+bool mp_w32_register_grid_project(struct MPContext *mpctx);

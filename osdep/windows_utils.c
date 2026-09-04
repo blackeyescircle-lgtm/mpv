@@ -25,9 +25,12 @@
 #include <d3d9.h>
 #include <dxgi1_2.h>
 #include <ole2.h>
+#include <knownfolders.h>
+#include <shlobj.h>
 #include <shobjidl.h>
 
 #include "common/common.h"
+#include "osdep/io.h"
 #include "windows_utils.h"
 #include "mpv_talloc.h"
 
@@ -248,4 +251,78 @@ wchar_t *mp_w32_get_shell_link_target(wchar_t *path)
     SAFE_RELEASE(psl);
     SAFE_RELEASE(ppf);
     return buf;
+}
+
+char *mp_w32_get_module_path(void *talloc_ctx)
+{
+    wchar_t *path = talloc_array(NULL, wchar_t, MP_PATH_MAX);
+    DWORD len = GetModuleFileNameW(NULL, path, MP_PATH_MAX);
+    char *result = len > 0 && len < MP_PATH_MAX
+                    ? mp_to_utf8(talloc_ctx, path) : NULL;
+    talloc_free(path);
+    return result;
+}
+
+char *mp_w32_get_desktop_path(void *talloc_ctx)
+{
+    wchar_t *path = NULL;
+    HRESULT hr = SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_CREATE,
+                                      NULL, &path);
+    char *result = SUCCEEDED(hr) ? mp_to_utf8(talloc_ctx, path) : NULL;
+    CoTaskMemFree(path);
+    return result;
+}
+
+bool mp_w32_create_shell_link(const char *shortcut, const char *target,
+                              const char *arguments,
+                              const char *working_directory,
+                              const char *icon, const char *description)
+{
+    void *tmp = talloc_new(NULL);
+    wchar_t *w_shortcut = mp_from_utf8(tmp, shortcut);
+    wchar_t *w_target = mp_from_utf8(tmp, target);
+    wchar_t *w_arguments = arguments ? mp_from_utf8(tmp, arguments) : NULL;
+    wchar_t *w_working = working_directory
+                            ? mp_from_utf8(tmp, working_directory) : NULL;
+    wchar_t *w_icon = icon ? mp_from_utf8(tmp, icon) : NULL;
+    wchar_t *w_description = description
+                                ? mp_from_utf8(tmp, description) : NULL;
+    if (!w_shortcut || !w_target) {
+        talloc_free(tmp);
+        return false;
+    }
+
+    HRESULT init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    bool uninitialize = SUCCEEDED(init);
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE) {
+        talloc_free(tmp);
+        return false;
+    }
+
+    IShellLinkW *link = NULL;
+    IPersistFile *persist = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                  &IID_IShellLinkW, (void **)&link);
+    if (SUCCEEDED(hr))
+        hr = IShellLinkW_SetPath(link, w_target);
+    if (SUCCEEDED(hr) && w_arguments)
+        hr = IShellLinkW_SetArguments(link, w_arguments);
+    if (SUCCEEDED(hr) && w_working)
+        hr = IShellLinkW_SetWorkingDirectory(link, w_working);
+    if (SUCCEEDED(hr) && w_icon)
+        hr = IShellLinkW_SetIconLocation(link, w_icon, 0);
+    if (SUCCEEDED(hr) && w_description)
+        hr = IShellLinkW_SetDescription(link, w_description);
+    if (SUCCEEDED(hr))
+        hr = IShellLinkW_QueryInterface(link, &IID_IPersistFile,
+                                        (void **)&persist);
+    if (SUCCEEDED(hr))
+        hr = IPersistFile_Save(persist, w_shortcut, true);
+
+    SAFE_RELEASE(persist);
+    SAFE_RELEASE(link);
+    if (uninitialize)
+        CoUninitialize();
+    talloc_free(tmp);
+    return SUCCEEDED(hr);
 }

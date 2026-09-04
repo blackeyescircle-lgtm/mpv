@@ -521,6 +521,11 @@ static const m_option_t mp_opts[] = {
         {"cplayer", 0}, {"pseudo-gui", 1}),
         .flags = M_OPT_PRE_PARSE | M_OPT_NOPROP},
 
+    {"grid", OPT_STRING(grid_layout)},
+    {"grid-project", OPT_STRING(grid_project), .flags = M_OPT_FILE},
+    {"grid-open-mode", OPT_STRING(grid_open_mode)},
+    {"grid-audio-count", OPT_INT(grid_audio_count), M_RANGE(1, 16)},
+
     {"shuffle", OPT_BOOL(shuffle), .flags = M_OPT_PRE_PARSE},
 
 // ------------------------- common options --------------------
@@ -1010,6 +1015,9 @@ static const m_option_t mp_opts[] = {
 
 static const struct MPOpts mp_default_opts = {
     .use_terminal = true,
+    .grid_layout = "no",
+    .grid_open_mode = "ask",
+    .grid_audio_count = 3,
     .msg_color = true,
     .softvol_max = 130,
     .softvol_volume = 100,

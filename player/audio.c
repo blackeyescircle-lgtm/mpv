@@ -39,6 +39,7 @@
 
 #include "core.h"
 #include "command.h"
+#include "grid.h"
 
 enum {
     AD_OK = 0,
@@ -446,6 +447,8 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     mpctx->ao = ao_init_best(mpctx->global, ao_flags, mp_wakeup_core_cb,
                              mpctx, mpctx->encode_lavc_ctx, out_rate,
                              out_format, out_channels);
+    if (mpctx->ao && mp_grid_enabled(mpctx->grid))
+        ao_set_grid_mixer(mpctx->ao, mpctx->grid, mp_grid_mix_audio);
 
     int ao_rate = 0;
     int ao_format = 0;

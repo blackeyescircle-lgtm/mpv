@@ -106,6 +106,10 @@ struct mp_async_queue *ao_get_queue(struct ao *ao);
 int ao_query_and_reset_events(struct ao *ao, int events);
 void ao_request_reload(struct ao *ao);
 void ao_hotplug_event(struct ao *ao);
+void ao_set_grid_mixer(struct ao *ao, void *ctx,
+                       void (*mix)(void *ctx, void **data, int samples,
+                                   int rate, int format,
+                                   const struct mp_chmap *channels));
 
 struct ao_hotplug;
 struct ao_hotplug *ao_hotplug_create(struct mpv_global *global,

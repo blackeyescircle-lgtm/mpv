@@ -34,6 +34,8 @@
 #include "osdep/als.h"
 #include "demux/stheader.h"
 
+struct mp_grid;
+
 // definitions used internally by the core player code
 
 enum stop_play_reason {
@@ -60,6 +62,7 @@ enum {
     // other constants
     OSD_LEVEL_INVISIBLE = 4,
     OSD_BAR_SEEK = 256,
+    OSD_BAR_GRID_SEEK = 257,
 
     MAX_NUM_VO_PTS = 100,
 };
@@ -241,6 +244,7 @@ extern const int num_ptracks[STREAM_TYPE_COUNT];
 typedef struct MPContext {
     bool initialized;
     bool is_cli;
+    bool grid_executable;
     mp_thread core_thread;
     struct mpv_global *global;
     struct MPOpts *opts;
@@ -249,6 +253,7 @@ typedef struct MPContext {
     struct m_config *mconfig;
     struct input_ctx *input;
     struct mp_client_api *clients;
+    struct mp_grid *grid;
     struct mp_dispatch_queue *dispatch;
     struct mp_cancel *playback_abort;
     // Number of asynchronous tasks that still need to finish until MPContext
@@ -282,6 +287,8 @@ typedef struct MPContext {
     char *osd_msg_text;
     bool osd_show_pos;
     struct osd_progbar_state osd_progbar;
+    int grid_osd_seek_tile;
+    bool grid_osd_seek_mouse_down;
 
     struct playlist *playlist;
     struct playlist_entry *playing; // currently playing file

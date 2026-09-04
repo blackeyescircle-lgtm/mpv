@@ -510,8 +510,8 @@ static bool handle_char(struct vo_w32_state *w32, WPARAM wc, bool decode)
 
 static void begin_dragging(struct vo_w32_state *w32)
 {
-    if (w32->current_fs ||
-        mp_input_test_dragging(w32->input_ctx, w32->mouse_x, w32->mouse_y))
+    if (w32->current_fs || mp_input_test_dragging(w32->input_ctx,
+                                                  w32->mouse_x, w32->mouse_y))
         return;
     // Window dragging hack
     ReleaseCapture();
@@ -1003,7 +1003,7 @@ static bool fit_rect_size(struct vo_w32_state *w32, RECT *rc, long n_w, long n_h
 }
 
 // If the window is bigger than the desktop, shrink to fit with same center.
-// Also, if the top edge is above the working area, move down to align.
+// Then translate it so every edge stays inside the monitor working area.
 static void fit_rect_on_screen(struct vo_w32_state *w32, RECT *rc)
 {
     RECT screen = get_working_area(w32);
@@ -1016,13 +1016,17 @@ static void fit_rect_on_screen(struct vo_w32_state *w32, RECT *rc)
 
     bool adjusted = fit_rect_size(w32, rc, rect_w(screen), rect_h(screen));
 
-    if (rc->top < screen.top) {
-        // if the top-edge of client area is above the target area (mainly
-        // because the client-area is centered but the title bar is taller
-        // than the bottom border), then move it down to align the edges.
-        // Windows itself applies the same constraint during manual move.
-        rc->bottom += screen.top - rc->top;
-        rc->top = screen.top;
+    long dx = 0, dy = 0;
+    if (rc->left < screen.left)
+        dx = screen.left - rc->left;
+    else if (rc->right > screen.right)
+        dx = screen.right - rc->right;
+    if (rc->top < screen.top)
+        dy = screen.top - rc->top;
+    else if (rc->bottom > screen.bottom)
+        dy = screen.bottom - rc->bottom;
+    if (dx || dy) {
+        OffsetRect(rc, dx, dy);
         adjusted = true;
     }
 
@@ -1536,8 +1540,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam,
     case WM_NCHITTEST:
         // Provide sizing handles for borderless windows
         if ((!w32->opts->border || !w32->opts->title_bar) && !w32->current_fs) {
-            return borderless_nchittest(w32, GET_X_LPARAM(lParam),
-                                        GET_Y_LPARAM(lParam));
+            LRESULT hit = borderless_nchittest(w32, GET_X_LPARAM(lParam),
+                                               GET_Y_LPARAM(lParam));
+            if (hit == HTCLIENT && w32->vo->extra.grid_empty &&
+                w32->vo->extra.grid_empty(w32->vo->extra.grid_ctx))
+                return HTCAPTION;
+            return hit;
+        }
+        if (!w32->current_fs && w32->vo->extra.grid_empty &&
+            w32->vo->extra.grid_empty(w32->vo->extra.grid_ctx))
+        {
+            LRESULT hit = DefWindowProcW(hWnd, message, wParam, lParam);
+            return hit == HTCLIENT ? HTCAPTION : hit;
         }
         break;
     case WM_APPCOMMAND:
@@ -2121,7 +2135,8 @@ static MP_THREAD_VOID gui_thread(void *ptr)
     if (SUCCEEDED(OleInitialize(NULL))) {
         ole_ok = true;
 
-        IDropTarget *dt = mp_w32_droptarget_create(w32->log, w32->opts, w32->input_ctx);
+        IDropTarget *dt = mp_w32_droptarget_create(w32->log, w32->opts,
+                                                   w32->input_ctx, w32->window);
         RegisterDragDrop(w32->window, dt);
 
         // ITaskbarList2 has the MarkFullscreenWindow method, which is used to

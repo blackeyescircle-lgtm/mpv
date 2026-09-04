@@ -44,6 +44,7 @@
 
 #include "core.h"
 #include "command.h"
+#include "grid.h"
 #include "screenshot.h"
 
 enum {
@@ -131,6 +132,7 @@ void uninit_video_out(struct MPContext *mpctx)
 {
     uninit_video_chain(mpctx);
     if (mpctx->video_out) {
+        mp_grid_set_vo(mpctx->grid, NULL);
         vo_destroy(mpctx->video_out);
         mpctx->video_out = NULL;
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
@@ -239,6 +241,10 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
             .encode_lavc_ctx = mpctx->encode_lavc_ctx,
             .wakeup_cb = mp_wakeup_core_cb,
             .wakeup_ctx = mpctx,
+            .grid_ctx = mpctx->grid,
+            .grid_snapshot = mp_grid_vo_snapshot,
+            .grid_empty = mp_grid_vo_empty,
+            .grid_layout = mp_grid_vo_layout,
         };
         mpctx->video_out = init_best_video_out(mpctx->global, &ex);
         if (!mpctx->video_out) {
@@ -247,6 +253,7 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
             mpctx->error_playing = MPV_ERROR_VO_INIT_FAILED;
             goto err_out;
         }
+        mp_grid_set_vo(mpctx->grid, mpctx->video_out);
         mpctx->mouse_cursor_visible = true;
     }
 

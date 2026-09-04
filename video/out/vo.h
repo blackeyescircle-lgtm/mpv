@@ -219,6 +219,7 @@ struct vo;
 struct osd_state;
 struct mp_image;
 struct mp_image_params;
+struct mp_grid_snapshot;
 
 struct vo_extra {
     struct input_ctx *input_ctx;
@@ -226,6 +227,10 @@ struct vo_extra {
     struct encode_lavc_context *encode_lavc_ctx;
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
+    void *grid_ctx;
+    bool (*grid_snapshot)(void *ctx, struct mp_grid_snapshot *snapshot);
+    bool (*grid_empty)(void *ctx);
+    bool (*grid_layout)(void *ctx, int *rows, int *columns);
 };
 
 struct vo_frame {

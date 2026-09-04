@@ -1,0 +1,185 @@
+name: Build macOS Intel DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing GitHub release tag to receive the DMG
+        required: true
+        default: v0.4.12
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-intel-dmg-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: macOS 12+ Intel x86_64
+    runs-on: macos-15-intel
+    timeout-minutes: 180
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+      MACOS_ARCH: intel
+      SWIFT_FLAGS: -target x86_64-apple-macosx12.0
+      TRAVIS_OS_NAME: macos-15-intel
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      FFMPEG_VERSION: 8.1.2
+      FFMPEG_SHA256: 464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([._-][A-Za-z0-9.-]+)?$ ]]; then
+            echo "Invalid release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release view "$RELEASE_TAG" >/dev/null
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Prepare Homebrew
+        shell: bash
+        run: |
+          set -euo pipefail
+          find /usr/local/bin -lname '*/Library/Frameworks/Python.framework/*' -delete -print
+          brew unlink python || true
+          brew link --overwrite python
+          prefix="$(brew --prefix)"
+          find "$prefix/bin" -lname '*/pkg-config@0*/*' -print \
+            -exec brew unlink pkg-config@0.29.2 \; -quit
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install -q \
+            autoconf automake cmake curl libtool meson nasm ninja \
+            pkgconf python xz
+
+      - name: Build mpv MultiView
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./ci/build-macos-compatible.sh
+
+      - name: Print Meson log on failure
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: cat ./build/meson-logs/meson-log.txt
+
+      - name: Create application bundle and DMG
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          meson compile -C build macos-bundle
+
+          app_root="$RUNNER_TEMP/mpv-grid-dmg"
+          app_path="$app_root/mpv MultiView.app"
+          rm -rf "$app_root"
+          mkdir -p "$app_root"
+          mv build/mpv.app "$app_path"
+
+          plist="$app_path/Contents/Info.plist"
+          plutil -replace CFBundleName -string "mpv MultiView" "$plist"
+          plutil -insert CFBundleDisplayName -string "mpv MultiView" "$plist" 2>/dev/null || \
+            plutil -replace CFBundleDisplayName -string "mpv MultiView" "$plist"
+          plutil -replace CFBundleIdentifier -string "io.mpv.multiview" "$plist"
+          plutil -insert LSMinimumSystemVersion -string "12.0" "$plist" 2>/dev/null || \
+            plutil -replace LSMinimumSystemVersion -string "12.0" "$plist"
+
+          # osxbundle.py already copies every required dynamic library. Re-sign after
+          # changing Info.plist so the distributed app has a valid ad-hoc signature.
+          codesign --force --deep --sign - "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+
+          binary="$app_path/Contents/MacOS/mpv"
+          archs="$(lipo -archs "$binary")"
+          if [[ "$archs" != "x86_64" ]]; then
+            echo "Unexpected executable architecture: $archs" >&2
+            exit 1
+          fi
+          test "$(plutil -extract LSMinimumSystemVersion raw "$plist")" = "12.0"
+          file "$binary"
+          otool -l "$binary" | grep -A5 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+
+          # Audit every bundled Mach-O file. A dependency built for a newer OS
+          # must fail CI instead of producing a DMG that crashes on launch.
+          compatibility_failed=0
+          while IFS= read -r -d '' candidate; do
+            if ! file "$candidate" | grep -q 'Mach-O'; then
+              continue
+            fi
+
+            candidate_archs="$(lipo -archs "$candidate")"
+            if [[ " $candidate_archs " != *" x86_64 "* ]]; then
+              echo "Missing x86_64 architecture: $candidate ($candidate_archs)" >&2
+              compatibility_failed=1
+            fi
+
+            if nm -u "$candidate" 2>/dev/null | \
+                grep -q '_VTPixelRotationSessionCreate'; then
+              echo "Imports a VideoToolbox symbol missing on macOS 12: $candidate" >&2
+              compatibility_failed=1
+            fi
+
+            build_info="$(vtool -show-build "$candidate" 2>/dev/null || true)"
+            minimum="$(awk '$1 == "minos" { print $2; exit } \
+              $1 == "version" { print $2; exit }' <<< "$build_info")"
+            if [[ -n "$minimum" ]] && ! python3 - "$minimum" <<'PY'
+          import re
+          import sys
+
+          parts = [int(x) for x in re.findall(r'\d+', sys.argv[1])[:2]]
+          parts += [0] * (2 - len(parts))
+          raise SystemExit(0 if tuple(parts) <= (12, 0) else 1)
+          PY
+            then
+              echo "Requires macOS $minimum: $candidate" >&2
+              compatibility_failed=1
+            fi
+          done < <(find "$app_path/Contents" -type f -print0)
+          test "$compatibility_failed" -eq 0
+
+          "$binary" --no-config --version | tee "$RUNNER_TEMP/mpv-version.txt"
+          grep -Eq 'libavfilter[[:space:]]+11\.14\.102' "$RUNNER_TEMP/mpv-version.txt"
+
+          ln -s /Applications "$app_root/Applications"
+          dmg="mpv-grid-${RELEASE_TAG}-macos-intel.dmg"
+          hdiutil create \
+            -volname "mpv MultiView ${RELEASE_TAG}" \
+            -srcfolder "$app_root" \
+            -ov -format UDZO "$dmg"
+          hdiutil verify "$dmg"
+          shasum -a 256 "$dmg" >"${dmg}.sha256"
+
+          echo "dmg=$dmg" >>"$GITHUB_OUTPUT"
+          echo "checksum=${dmg}.sha256" >>"$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mpv-grid-${{ inputs.release_tag }}-macos-intel
+          if-no-files-found: error
+          path: |
+            ${{ steps.package.outputs.dmg }}
+            ${{ steps.package.outputs.checksum }}
+
+      - name: Attach DMG to GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            "${{ steps.package.outputs.dmg }}" \
+            "${{ steps.package.outputs.checksum }}" \
+            --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

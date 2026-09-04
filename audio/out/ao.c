@@ -455,6 +455,17 @@ bool ao_untimed(struct ao *ao)
     return ao->untimed;
 }
 
+void ao_set_grid_mixer(struct ao *ao, void *ctx,
+                       void (*mix)(void *ctx, void **data, int samples,
+                                   int rate, int format,
+                                   const struct mp_chmap *channels))
+{
+    if (!ao)
+        return;
+    ao->grid_mix_ctx = ctx;
+    ao->grid_mix = mix;
+}
+
 // ---
 
 struct ao_hotplug {

@@ -265,6 +265,11 @@ void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s)
     osd_obj->progbar_state.type = s->type;
     osd_obj->progbar_state.value = s->value;
     osd_obj->progbar_state.num_stops = s->num_stops;
+    osd_obj->progbar_state.use_area = s->use_area;
+    osd_obj->progbar_state.area_x0 = s->area_x0;
+    osd_obj->progbar_state.area_y0 = s->area_y0;
+    osd_obj->progbar_state.area_x1 = s->area_x1;
+    osd_obj->progbar_state.area_y1 = s->area_y1;
     MP_TARRAY_GROW(osd_obj, osd_obj->progbar_state.stops, s->num_stops);
     if (s->num_stops) {
         memcpy(osd_obj->progbar_state.stops, s->stops,
