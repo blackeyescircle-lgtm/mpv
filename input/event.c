@@ -19,6 +19,21 @@
 #include "input.h"
 #include "common/msg.h"
 
+void mp_event_drop_files_at(struct input_ctx *ictx, int num_files, char **files,
+                            enum mp_dnd_action action, int x, int y)
+{
+    void *tmp = talloc_new(NULL);
+    const char **args = talloc_zero_array(tmp, const char *, num_files + 6);
+    args[0] = "osd-auto";
+    args[1] = "grid-drop";
+    args[2] = talloc_asprintf(tmp, "%d", x);
+    args[3] = talloc_asprintf(tmp, "%d", y);
+    for (int i = 0; i < num_files; i++)
+        args[4 + i] = files[i];
+    mp_input_run_cmd(ictx, args);
+    talloc_free(tmp);
+}
+
 int mp_event_drop_mime_data(struct input_ctx *ictx, const char *mime_type,
                             bstr data, enum mp_dnd_action action)
 {

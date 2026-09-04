@@ -399,8 +399,21 @@ static void get_osd_bar_box(struct osd_state *osd, struct osd_object *obj,
     // and each bar ass event gets its own opaque box - breaking the bar.
     style->BorderStyle = 1; // outline
 
-    *o_w = track->PlayResX * (bar_opts->w / 100.0);
-    *o_h = track->PlayResY * (bar_opts->h / 100.0);
+    float area_x = 0;
+    float area_y = 0;
+    float area_w = track->PlayResX;
+    float area_h = track->PlayResY;
+    if (obj->progbar_state.use_area) {
+        area_x = obj->progbar_state.area_x0 * track->PlayResX;
+        area_y = obj->progbar_state.area_y0 * track->PlayResY;
+        area_w = (obj->progbar_state.area_x1 -
+                  obj->progbar_state.area_x0) * track->PlayResX;
+        area_h = (obj->progbar_state.area_y1 -
+                  obj->progbar_state.area_y0) * track->PlayResY;
+    }
+
+    *o_w = area_w * (bar_opts->w / 100.0);
+    *o_h = area_h * (bar_opts->h / 100.0);
 
     style->Outline = bar_opts->outline_size;
     // Rendering with shadow is broken (because there's more than one shape)
@@ -411,8 +424,8 @@ static void get_osd_bar_box(struct osd_state *osd, struct osd_object *obj,
 
     *o_border = style->Outline;
 
-    *o_x = get_align(bar_opts->align_x, track->PlayResX, *o_w, *o_border);
-    *o_y = get_align(bar_opts->align_y, track->PlayResY, *o_h, *o_border);
+    *o_x = area_x + get_align(bar_opts->align_x, area_w, *o_w, *o_border);
+    *o_y = area_y + get_align(bar_opts->align_y, area_h, *o_h, *o_border);
 }
 
 static void update_progbar(struct osd_state *osd, struct osd_object *obj)

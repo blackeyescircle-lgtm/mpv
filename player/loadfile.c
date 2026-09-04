@@ -57,9 +57,11 @@
 #include "sub/dec_sub.h"
 #include "external_files.h"
 #include "video/out/vo.h"
+#include "sub/osd.h"
 
 #include "core.h"
 #include "command.h"
+#include "grid.h"
 
 // Called from the demuxer thread if a new packet is available, or other changes.
 static void wakeup_demux(void *pctx)
@@ -1785,6 +1787,7 @@ done:
 static void play_current_file(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
+    double grid_start = MP_NOPTS_VALUE;
 
     mp_assert(mpctx->stop_play);
     mpctx->stop_play = 0;
@@ -1863,7 +1866,8 @@ static void play_current_file(struct MPContext *mpctx)
     load_per_file_options(mpctx->mconfig, mpctx->playing->params,
                           mpctx->playing->num_params);
 
-    mpctx->remaining_file_loops = mpctx->opts->loop_file;
+    mpctx->remaining_file_loops = mp_grid_enabled(mpctx->grid)
+                                    ? 0 : mpctx->opts->loop_file;
     mp_notify_property(mpctx, "remaining-file-loops");
     mpctx->remaining_ab_loops = mpctx->opts->ab_loop_count;
     mp_notify_property(mpctx, "remaining-ab-loops");
@@ -1998,6 +2002,7 @@ static void play_current_file(struct MPContext *mpctx)
 
     update_playback_speed(mpctx);
 
+    mp_grid_file_started(mpctx->grid);
     reinit_video_chain(mpctx);
     reinit_audio_chain(mpctx);
     reinit_sub_all(mpctx);
@@ -2034,6 +2039,8 @@ static void play_current_file(struct MPContext *mpctx)
     mpctx->playing->playlist_prev_attempt = false;
     mpctx->playlist->playlist_completed = false;
     mpctx->playlist->playlist_started = true;
+    grid_start = mp_grid_file_loaded(mpctx->grid, mpctx->filename,
+                                     get_time_length(mpctx), mpctx->video_out);
     mp_notify(mpctx, MPV_EVENT_FILE_LOADED, NULL);
     update_screensaver_state(mpctx);
     clear_playlist_paths(mpctx);
@@ -2068,6 +2075,8 @@ static void play_current_file(struct MPContext *mpctx)
 
     // (Not get_play_start_pts(), which would always trigger a seek.)
     double play_start_pts = rel_time_to_abs(mpctx, opts->play_start);
+    if (play_start_pts == MP_NOPTS_VALUE && grid_start != MP_NOPTS_VALUE)
+        play_start_pts = grid_start;
 
     // Backward playback -> start from end by default.
     if (play_start_pts == MP_NOPTS_VALUE && opts->play_dir < 0)
@@ -2089,6 +2098,10 @@ static void play_current_file(struct MPContext *mpctx)
     MP_VERBOSE(mpctx, "EOF code: %d  \n", mpctx->stop_play);
 
 terminate_playback:
+
+    mp_grid_file_unloading(mpctx->grid,
+                           mpctx->stop_play == AT_END_OF_FILE &&
+                           mpctx->opts->play_frames < 0);
 
     if (!mpctx->stop_play)
         mpctx->stop_play = PT_ERROR;

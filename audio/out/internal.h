@@ -43,6 +43,9 @@ struct ao {
     struct encode_lavc_context *encode_lavc_ctx;
     void (*wakeup_cb)(void *ctx);
     void *wakeup_ctx;
+    void *grid_mix_ctx;
+    void (*grid_mix)(void *ctx, void **data, int samples, int rate,
+                     int format, const struct mp_chmap *channels);
     struct mp_log *log; // Using e.g. "[ao/coreaudio]" as prefix
     int init_flags; // AO_INIT_* flags
     bool stream_silence;        // if audio inactive, just play silence

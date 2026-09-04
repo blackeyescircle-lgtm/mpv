@@ -68,6 +68,7 @@
 #include "core.h"
 #include "client.h"
 #include "command.h"
+#include "grid.h"
 #include "screenshot.h"
 
 #include "stream/stream_curl.h"
@@ -75,6 +76,168 @@
 static const char def_config[] =
 #include "etc/builtin.conf.inc"
 ;
+
+static char grid_input_conf[] =
+    "TAB grid-cycle-active 1\n"
+    "Shift+TAB grid-cycle-active -1\n"
+    "SPACE grid-pause\n"
+    "Ctrl+SPACE grid-pause-all\n"
+    "LEFT grid-seek -1 -5 relative\n"
+    "RIGHT grid-seek -1 5 relative\n"
+    "UP grid-seek -1 30 relative\n"
+    "DOWN grid-seek -1 -30 relative\n"
+    "m grid-mute\n"
+    "Shift+m grid-solo\n"
+    "+ grid-volume -1 0.05 add\n"
+    "- grid-volume -1 -0.05 add\n"
+    "[ grid-speed -1 -0.1 add\n"
+    "] grid-speed -1 0.1 add\n"
+    "b grid-fixed-start\n"
+    "Ctrl+s grid-save\n"
+    "Ctrl+Shift+s grid-save\n"
+    "MBTN_LEFT grid-mouse-zoom\n"
+    "MOUSE_MOVE grid-zoom-move\n";
+
+static char grid_switch_conf[] =
+    "F1 grid-desktop-shortcut\n"
+    "F2 grid-resume-project\n"
+    "WHEEL_UP grid-hover-seek 5\n"
+    "WHEEL_DOWN grid-hover-seek -5\n"
+    "Shift+WHEEL_UP grid-hover-seek 5\n"
+    "Shift+WHEEL_DOWN grid-hover-seek -5\n"
+    "ESC quit\n"
+    "0 grid-disable\n"
+    "1 grid-disable\n"
+    "2 grid-layout 2 2\n"
+    "3 grid-layout 3 3\n"
+    "4 grid-layout 4 4\n"
+    "5 grid-layout 2 3\n"
+    "6 grid-layout 3 4\n"
+    "Ctrl+1 grid-disable\n"
+    "Ctrl+2 grid-layout 2 2\n"
+    "Ctrl+3 grid-layout 3 3\n"
+    "Ctrl+4 grid-layout 4 4\n"
+    "Ctrl+5 grid-layout 2 3\n"
+    "Ctrl+6 grid-layout 3 4\n";
+
+struct grid_ini_config {
+    char *keys;
+    char *grid_keys;
+    bool have_keys;
+    bool have_grid_keys;
+};
+
+static char *grid_ini_trim(char *text)
+{
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+        text++;
+    char *end = text + strlen(text);
+    while (end > text && (end[-1] == ' ' || end[-1] == '\t' ||
+                          end[-1] == '\r' || end[-1] == '\n'))
+        *--end = '\0';
+    return text;
+}
+
+static void grid_ini_add_binding(struct MPContext *mpctx, char **bindings,
+                                 const char *key, const char *command)
+{
+    if (!*bindings)
+        *bindings = talloc_strdup(mpctx, "");
+    *bindings = talloc_asprintf_append_buffer(*bindings, "%s %s\n", key,
+                                               command);
+}
+
+static struct grid_ini_config load_grid_ini(struct MPContext *mpctx)
+{
+    struct grid_ini_config result = {0};
+    char *path = mp_find_user_file(NULL, mpctx->global, "exe_dir",
+                                   "mpv-grid.ini");
+    FILE *file = path ? fopen(path, "rb") : NULL;
+    if (!file) {
+        talloc_free(path);
+        return result;
+    }
+
+    enum {
+        GRID_INI_NONE,
+        GRID_INI_SETTINGS,
+        GRID_INI_KEYS,
+        GRID_INI_GRID_KEYS,
+    } section = GRID_INI_NONE;
+    char line[4096];
+    int line_number = 0;
+    while (fgets(line, sizeof(line), file)) {
+        line_number++;
+        char *text = line;
+        if (line_number == 1 && (unsigned char)text[0] == 0xef &&
+            (unsigned char)text[1] == 0xbb && (unsigned char)text[2] == 0xbf)
+            text += 3;
+        text = grid_ini_trim(text);
+        if (!text[0] || text[0] == '#' || text[0] == ';')
+            continue;
+        if (!strcmp(text, "[settings]")) {
+            section = GRID_INI_SETTINGS;
+            continue;
+        }
+        if (!strcmp(text, "[keys]")) {
+            section = GRID_INI_KEYS;
+            result.have_keys = true;
+            continue;
+        }
+        if (!strcmp(text, "[grid-keys]")) {
+            section = GRID_INI_GRID_KEYS;
+            result.have_grid_keys = true;
+            continue;
+        }
+        size_t text_len = strlen(text);
+        if (text[0] == '[' && text_len > 1 && text[text_len - 1] == ']') {
+            MP_WARN(mpctx, "%s:%d: unknown section ignored.\n", path,
+                    line_number);
+            section = GRID_INI_NONE;
+            continue;
+        }
+
+        char *equals = strchr(text, '=');
+        if (!equals) {
+            MP_WARN(mpctx, "%s:%d: expected key=value.\n", path,
+                    line_number);
+            continue;
+        }
+        *equals = '\0';
+        char *key = grid_ini_trim(text);
+        char *value = grid_ini_trim(equals + 1);
+        if (!key[0] || !value[0]) {
+            MP_WARN(mpctx, "%s:%d: empty key or value ignored.\n", path,
+                    line_number);
+            continue;
+        }
+
+        if (section == GRID_INI_SETTINGS) {
+            if (m_config_set_option_cli(mpctx->mconfig, bstr0(key),
+                                        bstr0(value),
+                                        M_SETOPT_FROM_CONFIG_FILE) < 0)
+                MP_WARN(mpctx, "%s:%d: invalid setting ignored.\n", path,
+                        line_number);
+        } else if (section == GRID_INI_KEYS) {
+            grid_ini_add_binding(mpctx, &result.keys, key, value);
+        } else if (section == GRID_INI_GRID_KEYS) {
+            grid_ini_add_binding(mpctx, &result.grid_keys, key, value);
+        } else {
+            MP_WARN(mpctx, "%s:%d: entry outside a section ignored.\n", path,
+                    line_number);
+        }
+    }
+    if (ferror(file))
+        MP_WARN(mpctx, "Error while reading %s.\n", path);
+    fclose(file);
+    if (result.have_keys && !result.keys)
+        result.keys = talloc_strdup(mpctx, "");
+    if (result.have_grid_keys && !result.grid_keys)
+        result.grid_keys = talloc_strdup(mpctx, "");
+    MP_INFO(mpctx, "Loaded mpv Grid configuration: %s\n", path);
+    talloc_free(path);
+    return result;
+}
 
 #if HAVE_WIN32_SMTC
 #include "osdep/win32/smtc.h"
@@ -183,7 +346,13 @@ void mp_destroy(struct MPContext *mpctx)
     mpctx->ipc_ctx = NULL;
 
     uninit_audio_out(mpctx);
+    // Stop Grid workers while its callback state is still alive, then stop the
+    // VO thread before freeing that state. The VO can otherwise race a final
+    // grid snapshot against teardown.
+    mp_grid_prepare_destroy(mpctx->grid);
     uninit_video_out(mpctx);
+    mp_grid_destroy(mpctx->grid);
+    mpctx->grid = NULL;
 
     // If it's still set here, it's an error.
     encode_lavc_free(mpctx->encode_lavc_ctx);
@@ -318,6 +487,7 @@ struct MPContext *mp_create(void)
     clipboard_init(mpctx);
     screenshot_init(mpctx);
     command_init(mpctx);
+    mpctx->grid = mp_grid_create(mpctx);
     init_libav(mpctx->global);
     mp_clients_init(mpctx);
     mpctx->osd = osd_create(mpctx->global);
@@ -367,6 +537,10 @@ int mp_initialize(struct MPContext *mpctx, char **options)
 
     mp_parse_cfgfiles(mpctx);
 
+    struct grid_ini_config grid_ini = {0};
+    if (mpctx->grid_executable && opts->load_config)
+        grid_ini = load_grid_ini(mpctx);
+
     if (options) {
         int r = m_config_parse_mp_command_line(mpctx->mconfig, mpctx->playlist,
                                                mpctx->global, options);
@@ -380,12 +554,47 @@ int mp_initialize(struct MPContext *mpctx, char **options)
         m_config_set_profile(mpctx->mconfig, "pseudo-gui", 0);
     }
 
+    if (!mp_grid_configure(mpctx->grid))
+        return -1;
+
+#if HAVE_WIN32_DESKTOP
+    if (mp_grid_enabled(mpctx->grid)) {
+        m_config_set_option_cli(mpctx->mconfig, bstr0("vo"), bstr0("gpu-next"),
+                                M_SETOPT_NO_OVERWRITE);
+        m_config_set_option_cli(mpctx->mconfig, bstr0("gpu-api"), bstr0("d3d11"),
+                                M_SETOPT_NO_OVERWRITE);
+        m_config_set_option_cli(mpctx->mconfig, bstr0("hwdec"),
+                                bstr0("d3d11va-copy"), M_SETOPT_NO_OVERWRITE);
+    }
+#endif
+
+    char *grid_path = mp_grid_main_path(mpctx->grid, NULL);
+    if (grid_path) {
+        mp_grid_populate_main_playlist(mpctx->grid, mpctx->playlist);
+        talloc_free(grid_path);
+    }
+
     // Backup the default settings, which should not be stored in the resume
     // config files. This explicitly includes values set by config files and
     // the command line.
     m_config_backup_watch_later_opts(mpctx->mconfig);
 
     mp_input_load_config(mpctx->input);
+    bool grid_controls = opts->grid_layout && strcmp(opts->grid_layout, "no");
+    if (grid_controls) {
+        char *switch_conf = grid_ini.have_keys ? grid_ini.keys
+                                               : grid_switch_conf;
+        char *active_conf = grid_ini.have_grid_keys ? grid_ini.grid_keys
+                                                    : grid_input_conf;
+        mp_input_define_section(mpctx->input, "grid-switch", "<mpv-grid>",
+                                switch_conf, true, "mpv-grid");
+        mp_input_enable_section(mpctx->input, "grid-switch", MP_INPUT_ON_TOP);
+        mp_input_define_section(mpctx->input, "grid", "<mpv-grid>",
+                                active_conf, true, "mpv-grid");
+    }
+    if (mp_grid_enabled(mpctx->grid)) {
+        mp_input_enable_section(mpctx->input, "grid", MP_INPUT_ON_TOP);
+    }
 
     // From this point on, all mpctx members are initialized.
     mpctx->initialized = true;
@@ -461,8 +670,18 @@ int mpv_main(int argc, char *argv[])
 
     mpctx->is_cli = true;
 
+    bool grid_executable = argv && argv[0] &&
+                           strstr(mp_basename(argv[0]), "mpv-grid");
+    mpctx->grid_executable = grid_executable;
+    if (grid_executable)
+        m_config_set_option_cli(mpctx->mconfig, bstr0("grid"), bstr0("auto"), 0);
+
     char **options = argv && argv[0] ? argv + 1 : NULL; // skips program name
     int r = mp_initialize(mpctx, options);
+#if HAVE_WIN32_DESKTOP
+    if (grid_executable)
+        mp_w32_register_grid_project(mpctx);
+#endif
     if (r == 0)
         mp_play_files(mpctx);
 

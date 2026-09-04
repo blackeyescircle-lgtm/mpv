@@ -183,6 +183,12 @@ typedef struct MPOpts {
 
     int operation_mode;
 
+    // mpv-grid single-core multi-pipeline mode. "no" preserves upstream mpv.
+    char *grid_layout;
+    char *grid_project;
+    char *grid_open_mode;
+    int grid_audio_count;
+
     char **reset_options;
     char **script_files;
     char **script_opts;

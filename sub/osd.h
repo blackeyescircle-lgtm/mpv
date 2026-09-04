@@ -216,6 +216,8 @@ struct osd_progbar_state {
     float value;        // range 0.0-1.0
     float *stops;       // used for chapter indicators (0.0-1.0 each)
     int num_stops;
+    bool use_area;      // position the native bar inside a normalized sub-area
+    float area_x0, area_y0, area_x1, area_y1;
 };
 void osd_set_progbar(struct osd_state *osd, struct osd_progbar_state *s);
 

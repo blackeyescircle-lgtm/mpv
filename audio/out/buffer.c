@@ -157,8 +157,13 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
         if (!p->pending)
             return 0;
         void **pd = (void *)mp_aframe_get_data_rw(p->pending);
-        if (pd)
+        if (pd) {
+            if (ao->grid_mix)
+                ao->grid_mix(ao->grid_mix_ctx, pd,
+                             mp_aframe_get_size(p->pending), ao->samplerate,
+                             ao->format, &ao->channels);
             ao_post_process_data(ao, pd, mp_aframe_get_size(p->pending));
+        }
         return 1;
     }
 
@@ -171,6 +176,9 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
         }
     }
 
+    if (ao->grid_mix && pos > 0)
+        ao->grid_mix(ao->grid_mix_ctx, data, pos, ao->samplerate,
+                     ao->format, &ao->channels);
     ao_post_process_data(ao, data, pos);
     return pos;
 }

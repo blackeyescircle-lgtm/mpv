@@ -349,6 +349,7 @@ void set_osd_bar(struct MPContext *mpctx, int type,
     mpctx->osd_progbar.type = type;
     mpctx->osd_progbar.value = (val - min) / (max - min);
     mpctx->osd_progbar.num_stops = 0;
+    mpctx->osd_progbar.use_area = false;
     if (neutral > min && neutral < max) {
         float pos = (neutral - min) / (max - min);
         MP_TARRAY_APPEND(mpctx, mpctx->osd_progbar.stops,

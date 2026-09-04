@@ -172,6 +172,7 @@ sources = files(
     'player/configfiles.c',
     'player/discnav.c',
     'player/external_files.c',
+    'player/grid.c',
     'player/loadfile.c',
     'player/main.c',
     'player/misc.c',

@@ -52,6 +52,7 @@
 #include "common/common.h"
 #include "input/input.h"
 #include "input/keycodes.h"
+#include "sub/ass_mp.h"
 #include "sub/osd_state.h"
 #include "stream/stream.h"
 #include "demux/demux.h"
@@ -85,6 +86,7 @@
 #include "osdep/terminal.h"
 
 #include "core.h"
+#include "grid.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -4639,10 +4641,28 @@ static int mp_property_clipboard(void *ctx, struct m_property *prop,
 #define M_PROPERTY_DEPRECATED_ALIAS(name, real_property) \
     {(name), mp_property_deprecated_alias, .priv = (real_property)}
 
+static int mp_property_grid(void *ctx, struct m_property *prop,
+                            int action, void *arg)
+{
+    struct MPContext *mpctx = ctx;
+    switch (action) {
+    case M_PROPERTY_GET_TYPE:
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    case M_PROPERTY_GET:
+    case M_PROPERTY_GET_NODE:
+        mp_grid_to_node(mpctx->grid, arg);
+        return M_PROPERTY_OK;
+    default:
+        return M_PROPERTY_NOT_IMPLEMENTED;
+    }
+}
+
 // Base list of properties. This does not include option-mapped properties.
 static const struct m_property mp_properties_base[] = {
     // General
     {"pid", mp_property_pid},
+    {"grid", mp_property_grid},
     {"speed", mp_property_playback_speed},
     {"pitch", mp_property_playback_pitch},
     {"audio-speed-correction", mp_property_av_speed_correction, .priv = "a"},
@@ -7532,6 +7552,430 @@ static void cmd_notify_property(void *p)
     mp_notify_property(mpctx, cmd->args[0].v.s);
 }
 
+static bool grid_command_snapshot(struct mp_cmd_ctx *cmd,
+                                  struct mp_grid_snapshot *snapshot,
+                                  int *tile)
+{
+    if (!mp_grid_snapshot(cmd->mpctx->grid, snapshot)) {
+        cmd->success = false;
+        return false;
+    }
+    if (*tile < 0)
+        *tile = snapshot->active_tile;
+    if (*tile < 0 || *tile >= snapshot->num_cells) {
+        mp_grid_snapshot_free(snapshot);
+        cmd->success = false;
+        return false;
+    }
+    return true;
+}
+
+static void grid_command_done(struct mp_cmd_ctx *cmd, bool ok)
+{
+    cmd->success = ok;
+    if (ok) {
+        mp_notify_property(cmd->mpctx, "grid");
+        mp_grid_request_redraw(cmd->mpctx->grid);
+    }
+}
+
+static void cmd_grid_layout(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    grid_command_done(cmd, mp_grid_set_layout(cmd->mpctx->grid,
+                      cmd->args[0].v.i, cmd->args[1].v.i));
+}
+
+static void cmd_grid_disable(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    grid_command_done(cmd, mp_grid_disable(cmd->mpctx->grid));
+}
+
+static void cmd_grid_desktop_shortcut(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    char *path = NULL;
+    bool ok = mp_grid_create_desktop_shortcut(cmd->mpctx->grid, &path);
+    if (ok)
+        mp_cmd_msg(cmd, MSGL_INFO, "Saved playback shortcut: %s", path);
+    else
+        mp_cmd_msg(cmd, MSGL_ERR, "Could not save the playback shortcut.");
+    talloc_free(path);
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_resume_project(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    double position = MP_NOPTS_VALUE;
+    bool ok = mp_grid_resume_project(cmd->mpctx->grid, &position);
+    if (ok && position != MP_NOPTS_VALUE && cmd->mpctx->playback_initialized) {
+        set_pause_state(cmd->mpctx, false);
+        queue_seek(cmd->mpctx, MPSEEK_ABSOLUTE, position, MPSEEK_DEFAULT, 0);
+    } else if (!ok) {
+        mp_cmd_msg(cmd, MSGL_ERR, "当前播放不是带续播位置的 Grid 播放现场。");
+    }
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_active(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    grid_command_done(cmd, mp_grid_set_active(cmd->mpctx->grid,
+                                              cmd->args[0].v.i));
+}
+
+static void cmd_grid_cycle_active(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    grid_command_done(cmd, mp_grid_cycle_active(cmd->mpctx->grid,
+                                                cmd->args[0].v.i));
+}
+
+static void cmd_grid_append(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    grid_command_done(cmd, mp_grid_append(cmd->mpctx->grid,
+        cmd->args[0].v.i, cmd->args[1].v.s, cmd->args[2].v.d));
+}
+
+static void cmd_grid_remove(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    grid_command_done(cmd, mp_grid_remove(cmd->mpctx->grid,
+                                          cmd->args[0].v.i,
+                                          cmd->args[1].v.i));
+}
+
+static void cmd_grid_seek(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    int tile = cmd->args[0].v.i;
+    bool absolute = cmd->args[2].v.i;
+    if (tile < 0)
+        tile = mp_grid_get_active(cmd->mpctx->grid);
+    bool ok = mp_grid_seek(cmd->mpctx->grid, tile, cmd->args[1].v.d, absolute);
+    if (ok && tile == 0 && cmd->mpctx->playback_initialized)
+        queue_seek(cmd->mpctx, absolute ? MPSEEK_ABSOLUTE : MPSEEK_RELATIVE,
+                   cmd->args[1].v.d, MPSEEK_DEFAULT, 0);
+    grid_command_done(cmd, ok);
+}
+
+// priv: 0=pause, 1=mute. mode: -1=toggle, 0=no, 1=yes.
+static void cmd_grid_toggle(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    int tile = cmd->args[0].v.i;
+    struct mp_grid_snapshot snapshot;
+    if (!grid_command_snapshot(cmd, &snapshot, &tile))
+        return;
+    bool current = *(int *)cmd->priv == 0 ? snapshot.cells[tile].paused
+                                          : snapshot.cells[tile].muted;
+    bool value = cmd->args[1].v.i < 0 ? !current : !!cmd->args[1].v.i;
+    mp_grid_snapshot_free(&snapshot);
+    bool ok = *(int *)cmd->priv == 0
+        ? mp_grid_set_paused(cmd->mpctx->grid, tile, value)
+        : mp_grid_set_mute(cmd->mpctx->grid, tile, value);
+    if (ok && tile == 0) {
+        if (*(int *)cmd->priv == 0) {
+            set_pause_state(cmd->mpctx, value);
+        }
+    }
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_pause_all(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct mp_grid_snapshot snapshot;
+    if (!mp_grid_snapshot(cmd->mpctx->grid, &snapshot)) {
+        cmd->success = false;
+        return;
+    }
+    bool pause = false;
+    for (int i = 0; i < snapshot.num_cells; i++)
+        pause |= !snapshot.cells[i].paused;
+    bool ok = true;
+    for (int i = 0; i < snapshot.num_cells; i++)
+        ok &= mp_grid_set_paused(cmd->mpctx->grid, i, pause);
+    mp_grid_snapshot_free(&snapshot);
+    if (ok)
+        set_pause_state(cmd->mpctx, pause);
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_solo(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    int tile = cmd->args[0].v.i;
+    if (tile < 0)
+        tile = mp_grid_get_active(cmd->mpctx->grid);
+    grid_command_done(cmd, mp_grid_toggle_solo(cmd->mpctx->grid, tile));
+}
+
+// priv: 0=volume, 1=speed. mode: 0=set, 1=add.
+static void cmd_grid_number(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    int tile = cmd->args[0].v.i;
+    struct mp_grid_snapshot snapshot;
+    if (!grid_command_snapshot(cmd, &snapshot, &tile))
+        return;
+    double current = *(int *)cmd->priv == 0 ? snapshot.cells[tile].volume
+                                             : snapshot.cells[tile].speed;
+    double value = cmd->args[2].v.i ? current + cmd->args[1].v.d
+                                    : cmd->args[1].v.d;
+    mp_grid_snapshot_free(&snapshot);
+    bool ok = *(int *)cmd->priv == 0
+        ? mp_grid_set_volume(cmd->mpctx->grid, tile, value)
+        : mp_grid_set_speed(cmd->mpctx->grid, tile, value);
+    if (ok && tile == 0) {
+        if (*(int *)cmd->priv == 0) {
+            float volume = value * 100.0;
+            mp_property_do("volume", M_PROPERTY_SET, &volume, cmd->mpctx);
+        } else {
+            mp_property_do("speed", M_PROPERTY_SET, &value, cmd->mpctx);
+        }
+    }
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_fixed_start(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    double pos = cmd->args[1].v.d;
+    if (pos < 0)
+        pos = NAN;
+    grid_command_done(cmd, mp_grid_set_fixed_start(cmd->mpctx->grid,
+                                                   cmd->args[0].v.i, pos));
+}
+
+static void cmd_grid_save(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    const char *path = cmd->args[0].v.s;
+    grid_command_done(cmd, mp_grid_save_project(cmd->mpctx->grid,
+                                                path && path[0] ? path : NULL,
+                                                false));
+}
+
+static double grid_bar_align(double align, double frame, double object,
+                             double margin)
+{
+    frame -= margin * 2;
+    return margin + frame / 2 - object / 2 +
+           (frame - object) / 2 * align;
+}
+
+static bool grid_seek_bar_hit(struct MPContext *mpctx, int x, int y,
+                              int width, int height, double *ratio)
+{
+    if (mpctx->osd_progbar.type != OSD_BAR_GRID_SEEK ||
+        mpctx->osd_visible <= mp_time_sec() || width <= 0 || height <= 0)
+        return false;
+
+    struct mp_osd_render_opts *render_opts = mpctx->opts->osd_rend;
+    if (!render_opts || !render_opts->osd_bar_style)
+        return false;
+    int rows = 0, columns = 0;
+    if (!mp_grid_get_progress(mpctx->grid, mpctx->grid_osd_seek_tile,
+                              NULL, NULL, &rows, &columns) ||
+        rows <= 0 || columns <= 0)
+        return false;
+    struct osd_bar_style_opts *opts = render_opts->osd_bar_style;
+    int column = mpctx->grid_osd_seek_tile % columns;
+    int row = mpctx->grid_osd_seek_tile / columns;
+    struct mp_rect canvas = mp_grid_output_rect(mpctx->grid, width, height);
+    double area_x = canvas.x0 + (double)(mp_rect_w(canvas) * column / columns);
+    double area_y = canvas.y0 + (double)(mp_rect_h(canvas) * row / rows);
+    double area_w = canvas.x0 + mp_rect_w(canvas) * (column + 1) / columns - area_x;
+    double area_h = canvas.y0 + mp_rect_h(canvas) * (row + 1) / rows - area_y;
+    double bar_w = area_w * opts->w / 100.0;
+    double bar_h = area_h * opts->h / 100.0;
+    double border = opts->outline_size * height / MP_ASS_FONT_PLAYRESY;
+    double bar_x = area_x + grid_bar_align(opts->align_x, area_w, bar_w,
+                                           border);
+    double bar_y = area_y + grid_bar_align(opts->align_y, area_h, bar_h,
+                                           border);
+    double hit_pad = MPMAX(6.0, border + 2.0);
+
+    if (x < bar_x - border || x > bar_x + bar_w + border ||
+        y < bar_y - hit_pad || y > bar_y + bar_h + hit_pad)
+        return false;
+
+    *ratio = MPCLAMP((x - bar_x) / MPMAX(bar_w, 1.0), 0, 1);
+    return true;
+}
+
+static void grid_set_seek_bar(struct MPContext *mpctx, int tile, int rows,
+                              int columns, double ratio)
+{
+    set_osd_bar(mpctx, OSD_BAR_GRID_SEEK, 0, 1, 0, ratio);
+    if (mpctx->osd_progbar.type != OSD_BAR_GRID_SEEK ||
+        rows <= 0 || columns <= 0)
+        return;
+
+    int column = tile % columns;
+    int row = tile / columns;
+    struct vo *vo = mpctx->video_out;
+    int width = vo && vo->dwidth > 0 ? vo->dwidth : columns;
+    int height = vo && vo->dheight > 0 ? vo->dheight : rows;
+    struct mp_rect canvas = mp_grid_output_rect(mpctx->grid, width, height);
+    mpctx->osd_progbar.use_area = true;
+    mpctx->osd_progbar.area_x0 =
+        (canvas.x0 + (double)mp_rect_w(canvas) * column / columns) / width;
+    mpctx->osd_progbar.area_y0 =
+        (canvas.y0 + (double)mp_rect_h(canvas) * row / rows) / height;
+    mpctx->osd_progbar.area_x1 =
+        (canvas.x0 + (double)mp_rect_w(canvas) * (column + 1) / columns) / width;
+    mpctx->osd_progbar.area_y1 =
+        (canvas.y0 + (double)mp_rect_h(canvas) * (row + 1) / rows) / height;
+    osd_set_progbar(mpctx->osd, &mpctx->osd_progbar);
+}
+
+static bool grid_seek_to_ratio(struct MPContext *mpctx, int tile, double ratio)
+{
+    double duration = 0;
+    int rows = 0, columns = 0;
+    if (!mp_grid_get_progress(mpctx->grid, tile, NULL, &duration,
+                              &rows, &columns) || duration <= 0)
+        return false;
+
+    double position = MPCLAMP(ratio, 0, 1) * duration;
+    bool ok = mp_grid_seek(mpctx->grid, tile, position, true);
+    if (ok && tile == 0 && mpctx->playback_initialized)
+        queue_seek(mpctx, MPSEEK_ABSOLUTE, position, MPSEEK_DEFAULT, 0);
+    if (ok)
+        grid_set_seek_bar(mpctx, tile, rows, columns, ratio);
+    return ok;
+}
+
+static void cmd_grid_mouse_zoom(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct vo *vo = cmd->mpctx->video_out;
+    if (!vo) {
+        cmd->success = false;
+        return;
+    }
+    int x, y, hover;
+    mp_input_get_mouse_pos(cmd->mpctx->input, &x, &y, &hover);
+    bool up = cmd->cmd->is_up;
+    if (up && cmd->mpctx->grid_osd_seek_mouse_down) {
+        cmd->mpctx->grid_osd_seek_mouse_down = false;
+        grid_command_done(cmd, true);
+        return;
+    }
+    double ratio;
+    if (!up && grid_seek_bar_hit(cmd->mpctx, x, y, vo->dwidth, vo->dheight,
+                                 &ratio))
+    {
+        bool ok = grid_seek_to_ratio(cmd->mpctx,
+                                     cmd->mpctx->grid_osd_seek_tile, ratio);
+        cmd->mpctx->grid_osd_seek_mouse_down = ok;
+        grid_command_done(cmd, ok);
+        return;
+    }
+    bool ok = up ? mp_grid_set_zoom(cmd->mpctx->grid, -1, false, 0.5, 0.5)
+                 : mp_grid_zoom_at(cmd->mpctx->grid, x, y, vo->dwidth,
+                                   vo->dheight, true, false);
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_zoom_move(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct vo *vo = cmd->mpctx->video_out;
+    int x, y, hover;
+    if (!vo) {
+        cmd->success = false;
+        return;
+    }
+    mp_input_get_mouse_pos(cmd->mpctx->input, &x, &y, &hover);
+    grid_command_done(cmd, mp_grid_zoom_at(cmd->mpctx->grid, x, y,
+                                           vo->dwidth, vo->dheight,
+                                           true, true));
+}
+
+static void cmd_grid_hover_seek(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct vo *vo = cmd->mpctx->video_out;
+    int x, y, hover;
+    if (!mp_grid_enabled(cmd->mpctx->grid)) {
+        if (!cmd->mpctx->playback_initialized) {
+            cmd->success = false;
+            return;
+        }
+        double value = cmd->args[0].v.d;
+        mark_seek(cmd->mpctx);
+        queue_seek(cmd->mpctx, MPSEEK_RELATIVE, value, MPSEEK_EXACT,
+                   MPSEEK_FLAG_DELAY);
+        set_osd_function(cmd->mpctx, value > 0 ? OSD_FFW : OSD_REW);
+        if (cmd->seek_bar_osd)
+            cmd->mpctx->add_osd_seek_info |= OSD_SEEK_INFO_BAR;
+        if (cmd->seek_msg_osd)
+            cmd->mpctx->add_osd_seek_info |= OSD_SEEK_INFO_TEXT;
+        cmd->success = true;
+        return;
+    }
+    if (!vo) {
+        cmd->success = false;
+        return;
+    }
+    mp_input_get_mouse_pos(cmd->mpctx->input, &x, &y, &hover);
+    int tile = mp_grid_hit_test(cmd->mpctx->grid, x, y, vo->dwidth, vo->dheight);
+    bool ok = mp_grid_seek(cmd->mpctx->grid, tile, cmd->args[0].v.d, false);
+    if (ok && tile == 0)
+        queue_seek(cmd->mpctx, MPSEEK_RELATIVE, cmd->args[0].v.d,
+                   MPSEEK_DEFAULT, 0);
+    double position = 0, duration = 0;
+    int rows = 0, columns = 0;
+    if (ok && mp_grid_get_progress(cmd->mpctx->grid, tile, &position,
+                                   &duration, &rows, &columns))
+    {
+        double progress = duration > 0
+                            ? MPCLAMP(position / duration, 0, 1) : 0;
+        cmd->mpctx->grid_osd_seek_tile = tile;
+        grid_set_seek_bar(cmd->mpctx, tile, rows, columns, progress);
+    }
+    grid_command_done(cmd, ok);
+}
+
+static void cmd_grid_drop(void *p)
+{
+    struct mp_cmd_ctx *cmd = p;
+    struct vo *vo = cmd->mpctx->video_out;
+    if (!mp_grid_enabled(cmd->mpctx->grid)) {
+        if (cmd->num_args <= 2) {
+            cmd->success = false;
+            return;
+        }
+        playlist_clear(cmd->mpctx->playlist);
+        for (int i = 2; i < cmd->num_args; i++)
+            playlist_append_file(cmd->mpctx->playlist, cmd->args[i].v.s);
+        cmd->mpctx->playlist->current = playlist_get_first(cmd->mpctx->playlist);
+        mp_set_playlist_entry(cmd->mpctx, cmd->mpctx->playlist->current);
+        mp_notify(cmd->mpctx, MP_EVENT_CHANGE_PLAYLIST, NULL);
+        return;
+    }
+    if (!vo) {
+        cmd->success = false;
+        return;
+    }
+    int tile = mp_grid_hit_test(cmd->mpctx->grid, cmd->args[0].v.i,
+                                cmd->args[1].v.i, vo->dwidth, vo->dheight);
+    const char **paths = talloc_array(NULL, const char *,
+                                      MPMAX(0, cmd->num_args - 2));
+    for (int i = 2; i < cmd->num_args; i++)
+        paths[i - 2] = cmd->args[i].v.s;
+    bool ok = tile >= 0 && mp_grid_drop_files(cmd->mpctx->grid, tile,
+                                               cmd->num_args - 2, paths);
+    talloc_free(paths);
+    grid_command_done(cmd, ok);
+}
+
 /* This array defines all known commands.
  * The first field the command name used in libmpv and input.conf.
  * The second field is the handler function (see mp_cmd_def.handler and
@@ -7555,6 +7999,60 @@ static void cmd_notify_property(void *p)
 
 const struct mp_cmd_def mp_cmds[] = {
     { "ignore", cmd_ignore, .is_ignore = true, .is_noisy = true, },
+
+    { "grid-disable", cmd_grid_disable },
+    { "grid-desktop-shortcut", cmd_grid_desktop_shortcut },
+    { "grid-resume-project", cmd_grid_resume_project },
+    { "grid-layout", cmd_grid_layout,
+        { {"rows", OPT_INT(v.i)}, {"columns", OPT_INT(v.i)} } },
+    { "grid-active", cmd_grid_active, { {"tile", OPT_INT(v.i)} } },
+    { "grid-cycle-active", cmd_grid_cycle_active,
+        { {"direction", OPT_INT(v.i), OPTDEF_INT(1)} } },
+    { "grid-append", cmd_grid_append,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"path", OPT_STRING(v.s)},
+          {"fixed-start", OPT_TIME(v.d), OPTDEF_DOUBLE(0)} } },
+    { "grid-remove", cmd_grid_remove,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"index", OPT_INT(v.i), OPTDEF_INT(-1)} } },
+    { "grid-seek", cmd_grid_seek,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"seconds", OPT_TIME(v.d)},
+          {"mode", OPT_CHOICE(v.i, {"relative", 0}, {"absolute", 1}),
+              OPTDEF_INT(0)} }, .allow_auto_repeat = true, .scalable = true },
+    { "grid-pause", cmd_grid_toggle,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"mode", OPT_CHOICE(v.i, {"toggle", -1}, {"no", 0}, {"yes", 1}),
+              OPTDEF_INT(-1)} }, .priv = &(const int){0} },
+    { "grid-mute", cmd_grid_toggle,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"mode", OPT_CHOICE(v.i, {"toggle", -1}, {"no", 0}, {"yes", 1}),
+              OPTDEF_INT(-1)} }, .priv = &(const int){1} },
+    { "grid-pause-all", cmd_grid_pause_all },
+    { "grid-solo", cmd_grid_solo,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)} } },
+    { "grid-volume", cmd_grid_number,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"value", OPT_DOUBLE(v.d)},
+          {"mode", OPT_CHOICE(v.i, {"set", 0}, {"add", 1}), OPTDEF_INT(0)} },
+        .priv = &(const int){0}, .allow_auto_repeat = true },
+    { "grid-speed", cmd_grid_number,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"value", OPT_DOUBLE(v.d)},
+          {"mode", OPT_CHOICE(v.i, {"set", 0}, {"add", 1}), OPTDEF_INT(0)} },
+        .priv = &(const int){1}, .allow_auto_repeat = true },
+    { "grid-fixed-start", cmd_grid_fixed_start,
+        { {"tile", OPT_INT(v.i), OPTDEF_INT(-1)},
+          {"position", OPT_TIME(v.d), OPTDEF_DOUBLE(-1)} } },
+    { "grid-save", cmd_grid_save,
+        { {"path", OPT_STRING(v.s), OPTDEF_STR("")} } },
+    { "grid-mouse-zoom", cmd_grid_mouse_zoom, .on_updown = true },
+    { "grid-zoom-move", cmd_grid_zoom_move },
+    { "grid-hover-seek", cmd_grid_hover_seek,
+        { {"seconds", OPT_TIME(v.d)} }, .allow_auto_repeat = true },
+    { "grid-drop", cmd_grid_drop,
+        { {"x", OPT_INT(v.i)}, {"y", OPT_INT(v.i)},
+          {"paths", OPT_STRING(v.s)} }, .vararg = true },
 
     { "seek", cmd_seek,
         {

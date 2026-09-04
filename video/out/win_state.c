@@ -18,6 +18,8 @@
 #include "win_state.h"
 #include "vo.h"
 
+#include <math.h>
+
 #include "video/mp_image.h"
 
 static void calc_monitor_aspect(struct mp_vo_opts *opts, int scr_w, int scr_h,
@@ -112,6 +114,30 @@ void vo_calc_window_geometry(struct vo *vo, struct mp_vo_opts *opts,
 
     int scr_w = screen->x1 - screen->x0;
     int scr_h = screen->y1 - screen->y0;
+
+    // A Grid window starts at the combined native display size of all tiles.
+    // If that would not fit, scale the combined rectangle down uniformly so
+    // every viewport keeps the source aspect ratio without large letterbox
+    // areas. Explicit geometry and autofit options below can still override
+    // this default.
+    int grid_rows = 0, grid_columns = 0;
+    if (vo->params && vo->extra.grid_layout &&
+        vo->extra.grid_layout(vo->extra.grid_ctx, &grid_rows, &grid_columns))
+    {
+        int64_t grid_w = (int64_t)d_w * grid_columns;
+        int64_t grid_h = (int64_t)d_h * grid_rows;
+        if (grid_w <= scr_w && grid_h <= scr_h) {
+            d_w = MPCLAMP(grid_w, 1, 16000);
+            d_h = MPCLAMP(grid_h, 1, 16000);
+        } else {
+            double scale = MPMIN(scr_w / (double)grid_w,
+                                 scr_h / (double)grid_h);
+            d_w = MPCLAMP(llrint(grid_w * scale), 1, 16000);
+            d_h = MPCLAMP(llrint(grid_h * scale), 1, 16000);
+        }
+        MP_DBG(vo, "grid window size: %dx%d (%dx%d layout)\n",
+               d_w, d_h, grid_rows, grid_columns);
+    }
 
     int mon_w = monitor->x1 - monitor->x0;
     int mon_h = monitor->y1 - monitor->y0;
